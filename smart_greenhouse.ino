@@ -1,15 +1,4 @@
 /*
-Умная теплица на Arduino
-Автор: Смурыгин Алексей Сергеевич
-МОУ «Туношёнская средняя школа»
-Руководитель: Аврамова Ольга Борисовна
-Год: 2026
- 
-Проект по физике: автоматическое управление микроклиматом
-Лицензия: MIT (требуется указание автора)
-*/
-
-/*
   УМНАЯ ТЕПЛИЦА - КОМПЛЕКСНАЯ СИСТЕМА АВТОМАТИЗАЦИИ
   С ФУНКЦИЕЙ АВТОМАТИЧЕСКОГО ВОССТАНОВЛЕНИЯ ДИСПЛЕЯ
 */
@@ -109,7 +98,7 @@ bool forceDisplayReset = false;            // Создаем флаг (пере�
                                  // true = датчик подключен (фоторезистор)
                                  // false = датчик отключен
                                  
-#define ENABLE_WATER true        // Определяем макрос для включения/выключения датчика уровня воды
+#define ENABLE_WATER false        // Определяем макрос для включения/выключения датчика уровня воды
                                  // true = датчик подключен
                                  // false = датчик отключен
                                  // ОСОБЕННОСТЬ: Это БИНАРНЫЙ датчик (только 2 состояния)
@@ -132,7 +121,8 @@ bool forceDisplayReset = false;            // Создаем флаг (пере�
                                  // Датчик подключается к АНАЛОГОВОМУ пину A1
                                  // Фоторезистор меняет сопротивление в зависимости от света
 
-#define WATER_SENSOR_PIN 6       // пин для датчика воды
+#define WATER_SENSOR_PIN 6          // пин для сигнала датчика воды
+#define WATER_SENSOR_RELAY_PIN 8    // пин для управления реле датчика воды (НОВЫЙ!)
 
 // ----- ИСПОЛНИТЕЛЬНЫЕ УСТРОЙСТВА (устройства ВЫВОДА - Arduino УПРАВЛЯЕТ) -----
 #define PUMP_PIN 3               // Определяем пин для управления НАСОСОМ
@@ -225,11 +215,11 @@ const bool RELAY_INVERTED = true;    // Создаем константу для
                                      // Большинство реле-модулей для Arduino инвертированные
 
 // ----- КАЛИБРОВКА ДАТЧИКОВ -----
-const int SOIL_DRY_CALIB = 620;      // Создаем константу для калибровки СУХОЙ почвы
+const int SOIL_DRY_CALIB = 554;      // Создаем константу для калибровки СУХОЙ почвы
                                      // Значение датчика в СУХОЙ почве = 620 (из 1023)
                                      // Это соответствует 0% влажности
                                      
-const int SOIL_WET_CALIB = 310;      // Создаем константу для калибровки МОКРОЙ почвы
+const int SOIL_WET_CALIB = 233;      // Создаем константу для калибровки МОКРОЙ почвы
                                      // Значение датчика в МОКРОЙ почве = 310 (из 1023)
                                      // Это соответствует 100% влажности
                                      
@@ -918,6 +908,7 @@ void setup() {
   // Устанавливаем пин светодиода (STATUS_LED = 13) как ВЫХОД
   // Уже настраивали, но для надежности еще раз
   pinMode(STATUS_LED, OUTPUT);
+
   
   // ----- ШАГ 7: УСТАНОВКА НАЧАЛЬНОГО СОСТОЯНИЯ -----
   // При запуске все устройства должны быть выключены
@@ -1069,8 +1060,11 @@ void setup() {
     lcd->clear();
   }
 
-  // ----- ШАГ 14: НАСТРОЙКА ДАТЧИКА ВОДЫ -----
+    // ----- ШАГ 14: НАСТРОЙКА ДАТЧИКА ВОДЫ (Вариант Б) -----
   pinMode(WATER_SENSOR_PIN, INPUT_PULLUP);
+  // Настройка пина реле для управления питанием датчика воды
+  pinMode(WATER_SENSOR_RELAY_PIN, OUTPUT);
+  digitalWrite(WATER_SENSOR_RELAY_PIN, HIGH);  // HIGH = реле ВЫКЛЮЧЕНО (для инвертированного реле)
 }
 
 // ================================================
@@ -1231,7 +1225,7 @@ void readSensors() {
   // map(значение, от_мин, от_макс, к_мин, к_макс)
   // SOIL_DRY_CALIB (620) → 0%
   // SOIL_WET_CALIB (310) → 100%
-  int soilPercent = map(soilRaw, SOIL_DRY_CALIB, SOIL_WET_CALIB, 0, 100);
+  int soilPercent = map(soilRaw, SOIL_DRY_CALIB, SOIL_WET_CALIB, 100, 0);
   
   // Ограничиваем значение между 0 и 100%
   // Используем функцию constrain(значение, минимум, максимум)
@@ -1271,62 +1265,72 @@ void readSensors() {
   lightLevelFiltered = 50;
   #endif
   
-  // 4. ЧТЕНИЕ HCW-M203 (датчик уровня воды через реле) С ЗАЩИТОЙ ОТ ДРЕБЕЗГА
+  // 4. ИМПУЛЬСНОЕ ЧТЕНИЕ ДАТЧИКА ВОДЫ ЧЕРЕЗ РЕЛЕ (12В, включается только на 50 мс, раз в 10 секунд)
   #if ENABLE_WATER
-    // Настраиваем пин (если не сделано в setup)
+    // Настраиваем пины (если не сделано в setup)
     static bool pinConfigured = false;
     if (!pinConfigured) {
-      pinMode(WATER_SENSOR_PIN, INPUT_PULLUP);
+      pinMode(WATER_SENSOR_PIN, INPUT);
+      pinMode(WATER_SENSOR_RELAY_PIN, OUTPUT);
+      digitalWrite(WATER_SENSOR_RELAY_PIN, HIGH);  // HIGH = реле ВЫКЛ (питание датчика отключено)
       pinConfigured = true;
     }
     
-    // Читаем текущее состояние пина
-    // HIGH = воды нет (реле разомкнуто, подтяжка к питанию)
-    // LOW = вода есть (реле замкнуто на GND)
-    bool currentReading = (digitalRead(WATER_SENSOR_PIN) == HIGH);
+    // Статическая переменная для хранения времени последнего измерения
+    static unsigned long lastWaterReadTime = 0;
+    unsigned long currentMillis = millis();
     
-    // Переменные для защиты от дребезга (сохраняют значения между вызовами)
-    static unsigned long lastStableTime = 0;      // Время последнего изменения
-    static bool lastStableState = false;          // Последнее стабильное состояние
-    static bool previousRawReading = false;       // Предыдущее сырое чтение
-    
-    // Если состояние изменилось
-    if (currentReading != previousRawReading) {
-      lastStableTime = millis();                   // Запоминаем время изменения
-      previousRawReading = currentReading;         // Обновляем предыдущее значение
-    }
-    
-    // Если состояние стабильно в течение 2 секунд (2000 мс)
-    if (millis() - lastStableTime > 2000) {
-      // Если стабильное состояние отличается от текущего
-      if (lastStableState != currentReading) {
-        lastStableState = currentReading;          // Принимаем новое состояние
-        waterPresent = currentReading;              // Обновляем глобальную переменную
-        
-        // Выводим сообщение об изменении
-        Serial.print("HCW-M203: Water tank changed to ");
-        Serial.println(waterPresent ? "FULL" : "EMPTY");
+    // Проверяем, прошло ли 10 секунд с последнего измерения
+    if (currentMillis - lastWaterReadTime >= 10000) {
+      lastWaterReadTime = currentMillis;
+      
+      // ВКЛЮЧАЕМ питание датчика через реле
+      // Для инвертированного реле: LOW = ВКЛ, HIGH = ВЫКЛ
+      digitalWrite(WATER_SENSOR_RELAY_PIN, LOW);   // ВКЛЮЧИЛИ питание 12В на датчик
+      
+      // Ждём стабилизации датчика (50 мс)
+      delay(50);
+      
+      // Читаем состояние датчика
+      bool currentReading = (digitalRead(WATER_SENSOR_PIN) == HIGH);
+      
+      // ВЫКЛЮЧАЕМ питание датчика через реле
+      digitalWrite(WATER_SENSOR_RELAY_PIN, HIGH);  // ВЫКЛЮЧИЛИ питание
+      
+      // --- Защита от дребезга ---
+      static unsigned long lastStableTime = 0;
+      static bool lastStableState = false;
+      static bool previousRawReading = false;
+      
+      if (currentReading != previousRawReading) {
+        lastStableTime = currentMillis;
+        previousRawReading = currentReading;
       }
-    } else {
-      // Пока состояние не стабилизировалось, используем последнее стабильное
-      waterPresent = lastStableState;
-    }
-    
-    // Для отладки (раз в 10 секунд)
-    static unsigned long lastWaterDebug = 0;
-    if (millis() - lastWaterDebug > 10000) {
-      lastWaterDebug = millis();
-      Serial.print("HCW-M203: waterPresent = ");
-      Serial.println(waterPresent ? "YES (FULL)" : "NO (EMPTY)");
-      Serial.print("Raw pin state: ");
-      Serial.println(digitalRead(WATER_SENSOR_PIN) ? "HIGH" : "LOW");
-      Serial.print("Stable for: ");
-      Serial.print(millis() - lastStableTime);
-      Serial.println(" ms");
+      
+      if (currentMillis - lastStableTime > 2000) {
+        if (lastStableState != currentReading) {
+          lastStableState = currentReading;
+          waterPresent = currentReading;
+          Serial.print("WATER (12V): Tank changed to ");
+          Serial.println(waterPresent ? "FULL" : "EMPTY");
+        }
+      } else {
+        waterPresent = lastStableState;
+      }
+      
+      // Отладка
+      static int debugCounter = 0;
+      debugCounter++;
+      if (debugCounter >= 10) {
+        debugCounter = 0;
+        Serial.print("WATER (12V): waterPresent = ");
+        Serial.println(waterPresent ? "FULL" : "EMPTY");
+        Serial.print("Raw reading: ");
+        Serial.println(currentReading ? "HIGH (WATER)" : "LOW (NO WATER)");
+      }
     }
     
   #else
-    // Если датчик отключен - считаем что вода есть (для тестирования)
     waterPresent = true;
   #endif
 }
@@ -1436,105 +1440,26 @@ void controlSystems() {
   // Получаем текущее время в миллисекундах
   unsigned long currentTime = millis();
   
-// ===== 1. УПРАВЛЕНИЕ ПОЛИВОМ (5 СЕКУНД + 5 МИНУТ ОЖИДАНИЯ) =====
-  
-  // Проверяем, работает ли насос в данный момент
-  if (pumpState) {
-    // НАСОС ВКЛЮЧЕН - проверяем условия для выключения
-    
-    // Условие 1: насос работает больше 5 секунд
-    bool timeCondition = (currentTime - pumpStartTime > PUMP_RUN_TIME);
-    
-    // Условие 2: вода закончилась в баке (аварийное отключение)
-    bool noWaterCondition = (!waterPresent);  // <-- РАСКОММЕНТИРОВАНО
-    
-    // Проверяем, выполняется ли ЛЮБОЕ из условий
-    if (timeCondition || noWaterCondition) {  // <-- ИСПРАВЛЕНО
-      // Выключаем насос
-      digitalWrite(PUMP_PIN, LOW);
-      pumpState = false;
-      lastWatering = currentTime;
-      
-      // Логирование причины выключения
-      if (noWaterCondition) {
-        Serial.println("WATERING: Emergency stop - NO WATER in tank!");
-      } else {
-        Serial.println("WATERING: Stopping pump - 5 seconds elapsed");
-        Serial.println("WATERING: Now waiting 5 minutes for water absorption");
-      }
-    }
-    // Аварийная защита от залипания реле
-    if (currentTime - pumpStartTime > MAX_PUMP_RUN_TIME) {
-      digitalWrite(PUMP_PIN, LOW);
-      pumpState = false;
-      lastWatering = currentTime;
-      Serial.println("EMERGENCY: Pump forced OFF (stuck relay protection)");
-    }
-    
-  } else {
-    // НАСОС ВЫКЛЮЧЕН - проверяем условия для включения
-    
-    // УСЛОВИЯ ДЛЯ ВКЛЮЧЕНИЯ НАСОСА:
-    // 1. Влажность почвы < 20% (почва сухая)
-    // 2. В баке ЕСТЬ вода (ОБЯЗАТЕЛЬНО!)
-    // 3. Прошло минимум 5 минут с последнего полива
-    
-    bool soilDryCondition = (soilMoistureFiltered < SOIL_DRY);
-    bool waterPresentCondition = waterPresent;  // <-- РАСКОММЕНТИРОВАНО
-    bool cooldownCondition = (currentTime - lastWatering > WATERING_COOLDOWN);
-    
-    // Проверяем ВСЕ три условия
-    if (soilDryCondition && waterPresentCondition && cooldownCondition) {  // <-- ИСПРАВЛЕНО
-      // Все условия выполнены - ВКЛЮЧАЕМ НАСОС НА 5 СЕКУНД
-      digitalWrite(PUMP_PIN, HIGH);
-      pumpState = true;
-      pumpStartTime = currentTime;
-      
-      // Вывод сообщения на дисплей
-      if (currentDisplayMode == DISPLAY_NORMAL) {
-        lcd->clear();
-        safePrint("AUTO WATERING", 0, 0);
-        safePrint("2 SECONDS", 0, 1);
-        delay(1000);
-      }
-      
-      // Логирование
-      Serial.print("WATERING: Starting pump for 5 seconds (soil=");
-      Serial.print(soilMoistureFiltered);
-      Serial.println("%)");
-    }
-    else if (soilDryCondition && waterPresentCondition && !cooldownCondition) {  // <-- ИСПРАВЛЕНО
-      // Почва сухая, вода есть, но еще не прошло 5 минут
-      static unsigned long lastCooldownMessage = 0;
-      if (currentTime - lastCooldownMessage > 30000) {
-        lastCooldownMessage = currentTime;
-        unsigned long secondsLeft = (WATERING_COOLDOWN - (currentTime - lastWatering)) / 1000;
-        if (secondsLeft > 0) {
-          Serial.print("WATERING: Soil dry, waiting ");
-          Serial.print(secondsLeft);
-          Serial.println(" seconds");
-        }
-      }
-    }
-    else if (soilDryCondition && !waterPresentCondition) {
-      // Почва сухая, но воды НЕТ - выводим предупреждение
-      static unsigned long lastNoWaterWarning = 0;
-      if (currentTime - lastNoWaterWarning > 30000) {
-        lastNoWaterWarning = currentTime;
-        Serial.println("WARNING: Soil dry but NO WATER! Pump blocked.");
-        
-        // Мигаем светодиодом
-        for (int i = 0; i < 2; i++) {
-          digitalWrite(STATUS_LED, HIGH);
-          delay(100);
-          digitalWrite(STATUS_LED, LOW);
-          delay(100);
-        }
-      }
-    }
-
-  }
-  
+// ===== 1. УПРАВЛЕНИЕ ПОЛИВОМ (упрощённое для теста) =====
+  if (soilMoistureFiltered < 30) {       // Если влажность меньше 30%
+    digitalWrite(PUMP_PIN, HIGH);        // Включаем насос
+    pumpState = true;
+   Serial.println("PUMP: ON (dry soil)");
+    lcd->clear();
+   lcd->setCursor(0, 0);
+   lcd->print("DRY SOIL");
+   lcd->setCursor(0, 1);
+   lcd->print("PUMP ON");
+  } else {                               // Если влажность больше 30%
+   digitalWrite(PUMP_PIN, LOW);         // Выключаем насос
+   pumpState = false;
+   Serial.println("PUMP: OFF (wet soil)");
+   lcd->clear();
+   lcd->setCursor(0, 0);
+   lcd->print("WET SOIL");
+    lcd->setCursor(0, 1);
+   lcd->print("PUMP OFF");
+}  
   // ===== 2. УПРАВЛЕНИЕ ОСВЕЩЕНИЕМ (без изменений) =====
   
   if (lightLevelFiltered < LIGHT_ON_THRESHOLD && !lampState) {
@@ -2007,4 +1932,3 @@ void loop() {
      - При подключении проводов обратно - дисплей сам восстановится
      - 3 метода восстановления: мягкий сброс, переинициализация, сброс I2C
 */
-
