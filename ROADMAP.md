@@ -590,19 +590,831 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
 ---
 
-### Экологичность и энергоэффективность
+### 📋 ЭНЕРГОНЕЗАВИСИМАЯ ПАМЯТЬ (EEPROM) — ПРОРАБОТАНО
 
-| Аспект | Оценка | Пояснение |
-|--------|--------|-----------|
-| **Энергопотребление** | 5/10 | В режиме ожидания — низкое, при работе насоса/фитоленты — среднее |
-| **Экономия воды** | 9/10 | Капельный полив + контроль влажности → экономия до 70% воды |
-| **Экономия электроэнергии** | 7/10 | Освещение включается только при необходимости (не круглосуточно) |
-| **Использование переработанных материалов** | 8/10 | Корпус из подручных материалов, старые зарядки для питания серво |
-| **Отсутствие вредных выбросов** | 10/10 | Система не производит вредных выбросов |
-| **Безопасность для растений** | 9/10 | Импульсное питание датчика воды исключает электролиз |
-| **Безопасность для человека** | 8/10 | Низкое напряжение (12В, 5В), но требуется аккуратная изоляция |
+**Идея:** Даже после отключения электричества теплица запоминает все настройки, калибровки и историю поливов. При включении система восстанавливается в том же состоянии, в котором была до отключения.
 
-**Рекомендации по повышению энергоэффективности:**
-- Использовать более мощный блок питания с КПД >85%
-- Добавить режим энергосбережения (отключение дисплея ночью)
-- Использовать солнечную батарею для подзарядки (в перспективе)
+#### Проблема, которую решает:
+
+При отключении питания Arduino теряет все переменные — калибровка датчиков слетает, пороги сбрасываются, счётчик поливов обнуляется. Пользователю приходится заново настраивать теплицу. EEPROM (Electrically Erasable Programmable Read-Only Memory) — это энергонезависимая память, встроенная в микроконтроллер, которая сохраняет данные даже после выключения питания.
+
+#### Технические характеристики EEPROM на Arduino Uno:
+
+| Параметр | Значение |
+|----------|----------|
+| Объём памяти | 1024 байта (1 КБ) |
+| Циклов перезаписи | ~100 000 |
+| Время хранения данных | ~100 лет |
+| Скорость чтения/записи | ~50 мкс / ~3 мс |
+
+#### Что сохранять в EEPROM:
+
+| Адрес | Данные | Тип | Размер (байт) | Когда сохранять |
+|-------|--------|-----|---------------|-----------------|
+| 0 | SOIL_DRY_CALIB (сухая земля) | int | 2 | После калибровки |
+| 2 | SOIL_WET_CALIB (мокрая земля) | int | 2 | После калибровки |
+| 4 | DARK_VALUE (темнота) | int | 2 | После калибровки |
+| 6 | BRIGHT_VALUE (свет) | int | 2 | После калибровки |
+| 8 | SOIL_DRY (порог полива) | int | 2 | После изменения |
+| 10 | SOIL_WET (порог остановки) | int | 2 | После изменения |
+| 12 | OPEN_TEMP | float | 4 | После изменения |
+| 16 | CLOSE_TEMP | float | 4 | После изменения |
+| 20 | LIGHT_ON_THRESHOLD | int | 2 | После изменения |
+| 22 | LIGHT_OFF_THRESHOLD | int | 2 | После изменения |
+| 24 | PUMP_RUN_TIME | unsigned long | 4 | После изменения |
+| 28 | WATERING_COOLDOWN | unsigned long | 4 | После изменения |
+| 32 | currentPlantIndex | int | 2 | При выборе растения |
+| 34 | lastWatering (время последнего полива) | unsigned long | 4 | После каждого полива |
+| 38 | plantAge (возраст растения, дней) | int | 2 | Раз в день |
+| 40 | Режим работы (авто/ручной) | bool | 1 | При переключении режима |
+| 41-50 | Резерв | - | 10 | - |
+| 60-200 | История поливов (20 записей) | struct | 140 | После каждого полива |
+| 200-1023 | Свободно | - | 823 | - |
+
+#### Структура для истории поливов:
+```cpp
+// Структура одной записи о поливе (7 байт)
+struct WateringRecord {
+  unsigned long timestamp;  // время полива (4 байта)
+  int soilBefore;           // влажность до полива (2 байта)
+  int soilAfter;            // влажность после полива (2 байта)
+  float tempAtTime;         // температура во время полива (4 байта) — потребуется 4 байта, итого 12 байт
+};
+
+// Оптимизированная структура (для экономии места)
+struct WateringRecordCompact {
+  unsigned long timestamp;  // 4 байта
+  byte soilBefore;          // 1 байт (0-100%)
+  byte soilAfter;           // 1 байт (0-100%)
+  byte tempAtTime;          // 1 байт (0-50°C с точностью до 0.5°C)
+};  // Итого 7 байт на запись
+
+// Максимальное количество записей: ~140 байт / 7 байт = 20 записей
+const int MAX_WATERING_RECORDS = 20;
+WateringRecordCompact wateringHistory[MAX_WATERING_RECORDS];
+int historyCount = 0;
+```
+
+#### Полный код для работы с EEPROM:
+```cpp
+#include <EEPROM.h>
+
+// =====================================================================
+// ИНИЦИАЛИЗАЦИЯ EEPROM (ПРИ ПЕРВОМ ЗАПУСКЕ)
+// =====================================================================
+
+void initEEPROM() {
+  // Проверяем, есть ли признак "первого запуска"
+  int magicNumber;
+  EEPROM.get(50, magicNumber);
+  
+  if (magicNumber != 0xAA55) {  // Если признака нет — первый запуск
+    Serial.println("First boot: Initializing EEPROM with default settings");
+    
+    // Сохраняем значения по умолчанию
+    EEPROM.put(0, SOIL_DRY_CALIB);     // 554
+    EEPROM.put(2, SOIL_WET_CALIB);     // 233
+    EEPROM.put(4, DARK_VALUE);         // 0
+    EEPROM.put(6, BRIGHT_VALUE);       // 675
+    EEPROM.put(8, SOIL_DRY);           // 40
+    EEPROM.put(10, SOIL_WET);          // 70
+    EEPROM.put(12, OPEN_TEMP);         // 28.0
+    EEPROM.put(16, CLOSE_TEMP);        // 26.0
+    EEPROM.put(20, LIGHT_ON_THRESHOLD); // 30
+    EEPROM.put(22, LIGHT_OFF_THRESHOLD);// 50
+    EEPROM.put(24, PUMP_RUN_TIME);     // 2000
+    EEPROM.put(28, WATERING_COOLDOWN); // 600000
+    EEPROM.put(32, 0);                 // currentPlantIndex = 0
+    EEPROM.put(34, 0UL);               // lastWatering = 0
+    EEPROM.put(38, 0);                 // plantAge = 0
+    EEPROM.put(40, true);              // autoMode = true
+    
+    // Устанавливаем magic number (признак инициализации)
+    int magic = 0xAA55;
+    EEPROM.put(50, magic);
+    
+    Serial.println("EEPROM initialized with default settings");
+  } else {
+    Serial.println("EEPROM already initialized, loading settings...");
+  }
+}
+
+// =====================================================================
+// ЗАГРУЗКА ВСЕХ НАСТРОЕК ИЗ EEPROM
+// =====================================================================
+
+void loadSettingsFromEEPROM() {
+  // Загружаем калибровки
+  EEPROM.get(0, SOIL_DRY_CALIB);
+  EEPROM.get(2, SOIL_WET_CALIB);
+  EEPROM.get(4, DARK_VALUE);
+  EEPROM.get(6, BRIGHT_VALUE);
+  
+  // Загружаем пороги
+  EEPROM.get(8, SOIL_DRY);
+  EEPROM.get(10, SOIL_WET);
+  EEPROM.get(12, OPEN_TEMP);
+  EEPROM.get(16, CLOSE_TEMP);
+  EEPROM.get(20, LIGHT_ON_THRESHOLD);
+  EEPROM.get(22, LIGHT_OFF_THRESHOLD);
+  
+  // Загружаем временные параметры
+  EEPROM.get(24, PUMP_RUN_TIME);
+  EEPROM.get(28, WATERING_COOLDOWN);
+  
+  // Загружаем состояние системы
+  EEPROM.get(32, currentPlantIndex);
+  EEPROM.get(34, lastWatering);
+  EEPROM.get(38, plantAge);
+  EEPROM.get(40, autoMode);
+  
+  Serial.println("Settings loaded from EEPROM:");
+  Serial.print("  SOIL_DRY_CALIB: "); Serial.println(SOIL_DRY_CALIB);
+  Serial.print("  SOIL_WET_CALIB: "); Serial.println(SOIL_WET_CALIB);
+  Serial.print("  SOIL_DRY: "); Serial.println(SOIL_DRY);
+  Serial.print("  SOIL_WET: "); Serial.println(SOIL_WET);
+  Serial.print("  OPEN_TEMP: "); Serial.println(OPEN_TEMP);
+  Serial.print("  currentPlantIndex: "); Serial.println(currentPlantIndex);
+  Serial.print("  lastWatering: "); Serial.println(lastWatering);
+  Serial.print("  plantAge: "); Serial.println(plantAge);
+  Serial.print("  autoMode: "); Serial.println(autoMode ? "AUTO" : "MANUAL");
+}
+
+// =====================================================================
+// СОХРАНЕНИЕ ВСЕХ НАСТРОЕК В EEPROM
+// =====================================================================
+
+void saveSettingsToEEPROM() {
+  EEPROM.put(8, SOIL_DRY);
+  EEPROM.put(10, SOIL_WET);
+  EEPROM.put(12, OPEN_TEMP);
+  EEPROM.put(16, CLOSE_TEMP);
+  EEPROM.put(20, LIGHT_ON_THRESHOLD);
+  EEPROM.put(22, LIGHT_OFF_THRESHOLD);
+  EEPROM.put(24, PUMP_RUN_TIME);
+  EEPROM.put(28, WATERING_COOLDOWN);
+  EEPROM.put(32, currentPlantIndex);
+  EEPROM.put(34, lastWatering);
+  EEPROM.put(38, plantAge);
+  EEPROM.put(40, autoMode);
+  
+  Serial.println("Settings saved to EEPROM");
+}
+
+// =====================================================================
+// СОХРАНЕНИЕ КАЛИБРОВОК (только при изменении)
+// =====================================================================
+
+void saveCalibrationToEEPROM() {
+  static int lastDryCalib = 0, lastWetCalib = 0;
+  static int lastDark = 0, lastBright = 0;
+  
+  // Сохраняем только если изменились
+  if (lastDryCalib != SOIL_DRY_CALIB) {
+    EEPROM.put(0, SOIL_DRY_CALIB);
+    lastDryCalib = SOIL_DRY_CALIB;
+    Serial.println("SOIL_DRY_CALIB saved to EEPROM");
+  }
+  if (lastWetCalib != SOIL_WET_CALIB) {
+    EEPROM.put(2, SOIL_WET_CALIB);
+    lastWetCalib = SOIL_WET_CALIB;
+    Serial.println("SOIL_WET_CALIB saved to EEPROM");
+  }
+  if (lastDark != DARK_VALUE) {
+    EEPROM.put(4, DARK_VALUE);
+    lastDark = DARK_VALUE;
+    Serial.println("DARK_VALUE saved to EEPROM");
+  }
+  if (lastBright != BRIGHT_VALUE) {
+    EEPROM.put(6, BRIGHT_VALUE);
+    lastBright = BRIGHT_VALUE;
+    Serial.println("BRIGHT_VALUE saved to EEPROM");
+  }
+}
+
+// =====================================================================
+// СОХРАНЕНИЕ ИСТОРИИ ПОЛИВОВ (ЦИКЛИЧЕСКИЙ БУФЕР)
+// =====================================================================
+
+void saveWateringToHistory(int soilBefore, int soilAfter, float temp) {
+  // Сдвигаем старые записи
+  for (int i = MAX_WATERING_RECORDS - 1; i > 0; i--) {
+    EEPROM.get(60 + (i-1) * sizeof(WateringRecordCompact), wateringHistory[i]);
+  }
+  
+  // Сохраняем новую запись
+  wateringHistory[0].timestamp = millis();
+  wateringHistory[0].soilBefore = constrain(soilBefore, 0, 100);
+  wateringHistory[0].soilAfter = constrain(soilAfter, 0, 100);
+  wateringHistory[0].tempAtTime = (byte)(temp * 2);  // Сохраняем с точностью 0.5°C
+  
+  // Записываем в EEPROM
+  EEPROM.put(60, wateringHistory[0]);
+  
+  if (historyCount < MAX_WATERING_RECORDS) historyCount++;
+  
+  Serial.println("Watering record saved to EEPROM");
+}
+
+// =====================================================================
+// ЗАГРУЗКА ИСТОРИИ ПОЛИВОВ
+// =====================================================================
+
+void loadWateringHistory() {
+  historyCount = 0;
+  for (int i = 0; i < MAX_WATERING_RECORDS; i++) {
+    WateringRecordCompact temp;
+    EEPROM.get(60 + i * sizeof(WateringRecordCompact), temp);
+    if (temp.timestamp != 0) {  // Если запись не пустая
+      wateringHistory[i] = temp;
+      historyCount++;
+    }
+  }
+  Serial.print("Loaded "); Serial.print(historyCount); Serial.println(" watering records");
+}
+
+// =====================================================================
+// ВЫВОД СТАТИСТИКИ НА ДИСПЛЕЙ
+// =====================================================================
+
+void showStatistics() {
+  lcd->clear();
+  lcd->setCursor(0, 0);
+  lcd->print("Watering stats:");
+  lcd->setCursor(0, 1);
+  lcd->print("Total: ");
+  lcd->print(historyCount);
+  
+  delay(2000);
+  
+  if (historyCount > 0) {
+    lcd->clear();
+    lcd->setCursor(0, 0);
+    lcd->print("Last watering:");
+    lcd->setCursor(0, 1);
+    
+    float lastTemp = wateringHistory[0].tempAtTime / 2.0;
+    lcd->print("Temp: ");
+    lcd->print(lastTemp, 1);
+    lcd->print("C");
+    
+    delay(2000);
+    
+    lcd->clear();
+    lcd->setCursor(0, 0);
+    lcd->print("Soil before:");
+    lcd->setCursor(0, 1);
+    lcd->print(wateringHistory[0].soilBefore);
+    lcd->print("% -> ");
+    lcd->print(wateringHistory[0].soilAfter);
+    lcd->print("%");
+    
+    delay(2000);
+  }
+}
+```
+
+#### Автоматическое восстановление после сбоя питания:
+```cpp
+void setup() {
+  // ... инициализация пинов ...
+  
+  // Инициализируем EEPROM (при первом запуске)
+  initEEPROM();
+  
+  // Загружаем все настройки
+  loadSettingsFromEEPROM();
+  
+  // Загружаем историю поливов
+  loadWateringHistory();
+  
+  // Восстанавливаем состояние системы
+  if (autoMode) {
+    Serial.println("System restored to AUTO mode");
+  } else {
+    Serial.println("System restored to MANUAL mode");
+  }
+  
+  // ... остальной код setup ...
+}
+```
+
+### 🔮 УМНЫЙ АЛГОРИТМ САМООБУЧЕНИЯ (AI-агроном) — В ПЛАНАХ
+
+**Идея:** Система не просто выполняет жёсткие пороги, а **анализирует историю роста растений и оптимизирует параметры**.
+
+#### Проблема, которую решает:
+
+Существующие умные теплицы работают по статическим алгоритмам: задал порог полива 40% — и всегда поливай при 40%. Но разные сорта растений, разный возраст, разные условия требуют разного подхода. AI-агроном адаптируется под конкретное растение и конкретные условия.
+
+#### Как это работает:
+
+| Что анализирует | Как использует | Результат |
+|----------------|----------------|-----------|
+| Скорость роста растений | Увеличивает/уменьшает пороги полива | Растения растут быстрее |
+| Реакция на полив | Корректирует время работы насоса | Экономия воды |
+| Суточные колебания температуры | Прогнозирует открытие форточки | Стабильный микроклимат |
+| История урожайности | Выбирает лучшие параметры для следующего сезона | Повышение урожайности |
+
+#### Три уровня самообучения:
+
+**Уровень 1: Адаптивные пороги (базовый)**
+```cpp
+// Адаптивный порог полива (растёт вместе с растением)
+int adaptiveSoilDry = SOIL_DRY_BASE + (plantAge / 10);
+
+if (plantAge < 30) {
+  adaptiveSoilDry = SOIL_DRY_BASE - 10;  // молодым растениям нужно больше воды
+} else if (plantAge > 60) {
+  adaptiveSoilDry = SOIL_DRY_BASE + 5;   // взрослым — меньше
+}
+
+if (soilMoistureFiltered < adaptiveSoilDry && !pumpState) {
+  // Включаем полив с адаптивным порогом
+}
+```
+
+**Уровень 2: Обучение на истории (средний):**
+```cpp
+// Анализируем эффективность полива
+struct WateringRecord {
+  unsigned long timestamp;
+  int soilBefore;
+  int soilAfter;
+  float tempAtTime;
+  int effectiveness;  // на сколько процентов поднялась влажность
+};
+
+WateringRecord history[100];
+int recordCount = 0;
+
+void analyzeAndOptimize() {
+  int avgEffectiveness = 0;
+  for (int i = 0; i < recordCount; i++) {
+    avgEffectiveness += history[i].effectiveness;
+  }
+  avgEffectiveness /= recordCount;
+  
+  // Если полив слишком короткий (эффективность низкая) — увеличиваем время
+  if (avgEffectiveness < 20 && PUMP_RUN_TIME < 5000) {
+    PUMP_RUN_TIME += 500;
+    Serial.println("AI: Increased watering time due to low efficiency");
+  }
+  // Если полив слишком длинный (эффективность высокая) — уменьшаем
+  else if (avgEffectiveness > 60 && PUMP_RUN_TIME > 1000) {
+    PUMP_RUN_TIME -= 500;
+    Serial.println("AI: Decreased watering time due to high efficiency");
+  }
+}
+```
+
+**Уровень 3: Прогнозирование на основе трендов (продвинутый):**
+```cpp
+// Прогнозируем, когда почва высохнет
+float soilDryRate = 0;  // скорость высыхания (% в час)
+
+void calculateDryRate() {
+  static float lastSoil = 0;
+  static unsigned long lastTime = 0;
+  unsigned long now = millis();
+  
+  if (lastTime != 0 && now - lastTime > 3600000) {  // раз в час
+    soilDryRate = (lastSoil - soilMoistureFiltered) / ((now - lastTime) / 3600000.0);
+    lastSoil = soilMoistureFiltered;
+    lastTime = now;
+    
+    // Прогнозируем, через сколько часов потребуется полив
+    if (soilDryRate > 0) {
+      int hoursUntilDry = (soilMoistureFiltered - SOIL_DRY) / soilDryRate;
+      Serial.print("AI: Soil will be dry in ");
+      Serial.print(hoursUntilDry);
+      Serial.println(" hours");
+      
+      // Если скоро будет темно, можно полить сейчас
+      if (hoursUntilDry < 2 && lightLevelFiltered > 50) {
+        // Запланировать полив
+      }
+    }
+  }
+  lastSoil = soilMoistureFiltered;
+  lastTime = now;
+}
+```
+
+**Сравнение с обычной автоматикой:**
+| Параметр | Обычная автоматика | AI-агроном |
+|----------------|----------------|-----------|
+| Порог полива | Фиксированный (40%) | Адаптивный (30-50%) |
+| Время полива | Фиксированное (2 сек) | Адаптивное (1-5 сек) |
+| Учёт возраста растения | ❌ Нет | ✅ Да |
+| Учёт сезонных колебаний | ❌ Нет | ✅ Да |
+| Самообучение | ❌ Нет | ✅ Да |
+| Прогнозирование | ❌ Нет | ✅ Да |
+
+**Архитектура AI-агронома:**
+```cpp
+┌─────────────────────────────────────────────────────────────┐
+│                      AI-АГРОНОМ                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   │
+│  │  СБОР ДАННЫХ │ →  │   АНАЛИЗ     │ →  │  ОПТИМИЗАЦИЯ │   │
+│  │  - датчики   │    │  - тренды    │    │  - пороги    │   │
+│  │  - история   │    │  - паттерны  │    │  - тайминги  │   │
+│  └──────────────┘    └──────────────┘    └──────────────┘   │
+│         ↑                    ↓                    ↓         │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   │
+│  │  ОБУЧЕНИЕ    │ ←  │   ПАМЯТЬ     │ ←  │  ПРИМЕНЕНИЕ  │   │
+│  │  - нейросеть │    │  - EEPROM    │    │  - исполнит. │   │
+│  │  - веса      │    │  - SD карта  │    │  - устройства│   │
+│  └──────────────┘    └──────────────┘    └──────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Хранение данных (EEPROM + SD):**
+```cpp
+// Структура для хранения обученных параметров
+struct TrainedParams {
+  int optimalSoilDry;
+  int optimalSoilWet;
+  int optimalPumpTime;
+  float optimalTempMin;
+  float optimalTempMax;
+  int optimalLightOn;
+  int optimalLightOff;
+  int growthRate;           // скорость роста (мм/день)
+  int healthScore;          // оценка здоровья растения (0-100)
+};
+
+TrainedParams loadTrainedParams(int plantId) {
+  TrainedParams params;
+  // Загрузка из EEPROM или SD карты
+  EEPROM.get(plantId * sizeof(TrainedParams), params);
+  return params;
+}
+```
+
+**Интеграция с библиотекой растений:**
+```cpp
+// AI адаптирует параметры под конкретное растение
+void applyAISettings(int plantIndex) {
+  // 1. Загружаем базовые параметры из библиотеки растений
+  const Plant& base = plantDatabase[plantIndex];
+  
+  // 2. Загружаем обученные параметры для этого растения
+  TrainedParams trained = loadTrainedParams(plantIndex);
+  
+  // 3. Адаптируем параметры с учётом обучения
+  SOIL_DRY = (base.soilDry + trained.optimalSoilDry) / 2;
+  SOIL_WET = (base.soilWet + trained.optimalSoilWet) / 2;
+  PUMP_RUN_TIME = (base.wateringTime + trained.optimalPumpTime) / 2;
+  
+  // 4. Если растение болеет (низкий healthScore) — применяем щадящий режим
+  if (trained.healthScore < 50) {
+    SOIL_DRY = max(SOIL_DRY, 50);  // не даём пересыхать
+    Serial.println("AI: Plant health low, applying gentle mode");
+  }
+}
+```
+---
+
+### 📋 СИСТЕМА ОПОВЕЩЕНИЙ НА СЛУЧАЙ ЧРЕЗВЫЧАЙНЫХ СИТУАЦИЙ — ПРОРАБОТАНО
+
+**Идея:** Теплица сама сообщает о проблемах до того, как они уничтожат урожай.
+
+#### Проблема, которую решает:
+
+Умная теплица должна быть не только автоматической, но и **информировать пользователя** о критических ситуациях. Если закончилась вода или сломался датчик, растения могут погибнуть за несколько часов. Система оповещений заранее предупредит пользователя.
+
+#### Типы оповещений:
+
+| Ситуация | Тип оповещения | Приоритет | Канал связи |
+|----------|----------------|-----------|-------------|
+| Закончилась вода в баке | "Налейте воду! Насос не включится" | 🔴 КРИТИЧНЫЙ | Зуммер + светодиод + экран + Telegram |
+| Слишком жарко (>35°C) | "Аварийная жара! Откройте форточку" | 🔴 КРИТИЧНЫЙ | Зуммер + мигание экрана |
+| Слишком холодно (<10°C) | "Аварийный холод! Включите обогрев" | 🔴 КРИТИЧНЫЙ | Зуммер + экран + Telegram |
+| Насос не качает (нет протока) | "Проверьте насос! Воздушная пробка или засор" | 🟠 ВЫСОКИЙ | Зуммер + светодиод |
+| Зависание программы | "Watchdog перезагрузил систему в X:XX" | 🟡 СРЕДНИЙ | Запись в лог |
+| Датчик вышел из строя | "Датчик X не отвечает! Проверьте подключение" | 🟠 ВЫСОКИЙ | Экран + зуммер |
+| Фитолента перегрелась | "Фитолента >60°C! Выключаю на 10 минут" | 🟠 ВЫСОКИЙ | Экран + Telegram |
+| Низкий уровень воды (<20%) | "Вода заканчивается! Осталось ~5 литров" | 🟡 СРЕДНИЙ | Экран |
+| Полив пропущен (почва сухая >6 часов) | "Растения не поливались 6 часов! Проверьте систему" | 🟡 СРЕДНИЙ | Экран + Telegram |
+| Сервопривод не отвечает | "Форточка не открывается! Проверьте серво" | 🟡 СРЕДНИЙ | Экран |
+
+#### Аппаратная реализация:
+
+**Компоненты:**
+- Зуммер (пин 7) — звуковое оповещение
+- Встроенный светодиод (пин 13) — визуальное оповещение
+- Режим мигания экрана — для критических ситуаций
+
+**Подключение зуммера:**
+```cpp
+Зуммер (+) → PIN 7 Arduino
+Зуммер (-) → GND Arduino
+```
+
+#### Код реализации:
+
+```cpp
+// =====================================================================
+// СИСТЕМА ОПОВЕЩЕНИЙ
+// =====================================================================
+
+#define BUZZER_PIN 7
+#define STATUS_LED 13
+
+// Типы оповещений
+enum AlertPriority {
+  PRIORITY_CRITICAL,   // Красный — срочно!
+  PRIORITY_HIGH,       // Оранжевый — важно
+  PRIORITY_MEDIUM,     // Жёлтый — внимание
+  PRIORITY_INFO        // Зелёный — информация
+};
+
+// Структура оповещения
+struct Alert {
+  const char* message;
+  AlertPriority priority;
+  unsigned long lastShown;
+  int repeatCount;
+};
+
+// Функция звукового оповещения
+void playAlert(AlertPriority priority) {
+  switch(priority) {
+    case PRIORITY_CRITICAL:
+      // Три длинных сигнала
+      for (int i = 0; i < 3; i++) {
+        tone(BUZZER_PIN, 1000, 500);
+        delay(600);
+        noTone(BUZZER_PIN);
+        delay(400);
+      }
+      break;
+      
+    case PRIORITY_HIGH:
+      // Два коротких сигнала
+      for (int i = 0; i < 2; i++) {
+        tone(BUZZER_PIN, 2000, 200);
+        delay(250);
+        noTone(BUZZER_PIN);
+        delay(250);
+      }
+      break;
+      
+    case PRIORITY_MEDIUM:
+      // Один короткий сигнал
+      tone(BUZZER_PIN, 3000, 100);
+      delay(150);
+      noTone(BUZZER_PIN);
+      break;
+      
+    default:
+      // Нет звука для информации
+      break;
+  }
+}
+
+// Функция светового оповещения (мигание)
+void flashLight(int times, int duration, AlertPriority priority) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(STATUS_LED, HIGH);
+    delay(duration);
+    digitalWrite(STATUS_LED, LOW);
+    delay(duration);
+  }
+  
+  // Для критических ситуаций — частое мигание
+  if (priority == PRIORITY_CRITICAL) {
+    for (int i = 0; i < 10; i++) {
+      digitalWrite(STATUS_LED, HIGH);
+      delay(100);
+      digitalWrite(STATUS_LED, LOW);
+      delay(100);
+    }
+  }
+}
+
+// Вывод сообщения на дисплей
+void showAlertOnDisplay(const char* message, AlertPriority priority) {
+  if (currentDisplayMode != DISPLAY_NORMAL) return;
+  
+  lcd->clear();
+  lcd->setCursor(0, 0);
+  
+  // Выбор иконки в зависимости от приоритета
+  switch(priority) {
+    case PRIORITY_CRITICAL:
+      lcd->print("!!! CRITICAL !!!");
+      break;
+    case PRIORITY_HIGH:
+      lcd->print("!! WARNING !!");
+      break;
+    case PRIORITY_MEDIUM:
+      lcd->print("! ATTENTION !");
+      break;
+    default:
+      lcd->print("INFO");
+      break;
+  }
+  
+  lcd->setCursor(0, 1);
+  // Обрезаем сообщение до 16 символов
+  char shortMsg[17];
+  strncpy(shortMsg, message, 16);
+  shortMsg[16] = '\0';
+  lcd->print(shortMsg);
+}
+
+// Основная функция проверки и отправки оповещений
+void checkAlerts() {
+  static unsigned long lastNoWaterAlert = 0;
+  static unsigned long lastHighTempAlert = 0;
+  static unsigned long lastLowTempAlert = 0;
+  static unsigned long lastSensorErrorAlert = 0;
+  unsigned long now = millis();
+  
+  // ===== 1. ПРОВЕРКА УРОВНЯ ВОДЫ (КРИТИЧНЫЙ) =====
+  if (!waterPresent && !pumpState) {
+    if (now - lastNoWaterAlert > 30000) {  // Не чаще раза в 30 секунд
+      lastNoWaterAlert = now;
+      
+      const char* msg = "NO WATER!";
+      showAlertOnDisplay(msg, PRIORITY_CRITICAL);
+      playAlert(PRIORITY_CRITICAL);
+      flashLight(3, 200, PRIORITY_CRITICAL);
+      
+      Serial.println("ALERT: CRITICAL - Water tank is EMPTY!");
+      
+      // Дополнительно: блокируем насос, чтобы не сгорел
+      if (pumpState) {
+        digitalWrite(PUMP_PIN, LOW);
+        pumpState = false;
+        Serial.println("EMERGENCY: Pump blocked due to no water");
+      }
+    }
+  }
+  
+  // ===== 2. ПРОВЕРКА ТЕМПЕРАТУРЫ (КРИТИЧНЫЙ) =====
+  if (tempFiltered > 35.0) {
+    if (now - lastHighTempAlert > 60000) {  // Не чаще раза в минуту
+      lastHighTempAlert = now;
+      
+      char msg[20];
+      snprintf(msg, 20, "TEMP: %.1fC!", tempFiltered);
+      showAlertOnDisplay(msg, PRIORITY_CRITICAL);
+      playAlert(PRIORITY_CRITICAL);
+      flashLight(3, 300, PRIORITY_CRITICAL);
+      
+      Serial.print("ALERT: CRITICAL - High temperature ");
+      Serial.print(tempFiltered);
+      Serial.println("C!");
+      
+      // Аварийное открытие форточки
+      if (!windowIsOpen) {
+        ventServo.write(SERVO_OPEN);
+        windowIsOpen = true;
+        Serial.println("EMERGENCY: Window opened due to high temperature");
+      }
+    }
+  }
+  
+  // ===== 3. ПРОВЕРКА НИЗКОЙ ТЕМПЕРАТУРЫ (ВЫСОКИЙ) =====
+  else if (tempFiltered < 10.0) {
+    if (now - lastLowTempAlert > 60000) {
+      lastLowTempAlert = now;
+      
+      char msg[20];
+      snprintf(msg, 20, "COLD: %.1fC!", tempFiltered);
+      showAlertOnDisplay(msg, PRIORITY_HIGH);
+      playAlert(PRIORITY_HIGH);
+      
+      Serial.print("ALERT: High - Low temperature ");
+      Serial.print(tempFiltered);
+      Serial.println("C!");
+      
+      // Аварийное закрытие форточки
+      if (windowIsOpen) {
+        ventServo.write(SERVO_CLOSED);
+        windowIsOpen = false;
+        Serial.println("EMERGENCY: Window closed due to low temperature");
+      }
+    }
+  }
+  
+  // ===== 4. ПРОВЕРКА ОШИБКИ ДАТЧИКА DHT11 =====
+  if (dhtErrorCount > 5) {
+    if (now - lastSensorErrorAlert > 120000) {  // Не чаще раза в 2 минуты
+      lastSensorErrorAlert = now;
+      
+      showAlertOnDisplay("DHT11 ERROR!", PRIORITY_HIGH);
+      playAlert(PRIORITY_HIGH);
+      flashLight(2, 150, PRIORITY_HIGH);
+      
+      Serial.println("ALERT: High - DHT11 sensor not responding!");
+    }
+  }
+  
+  // ===== 5. ПРОВЕРКА ДАТЧИКА ВЛАЖНОСТИ ПОЧВЫ (вышел из строя) =====
+  static int lastSoilRaw = 0;
+  if (abs(lastSoilRaw - soilMoistureFiltered) < 2 && 
+      lastSoilRaw != 0 && 
+      millis() > 600000) {  // Через 10 минут после старта
+    if (now - lastSensorErrorAlert > 300000) {  // Не чаще раза в 5 минут
+      lastSensorErrorAlert = now;
+      showAlertOnDisplay("SOIL SENSOR STUCK!", PRIORITY_HIGH);
+      Serial.println("ALERT: High - Soil moisture sensor may be stuck!");
+    }
+  }
+  lastSoilRaw = soilMoistureFiltered;
+  
+  // ===== 6. ПРОВЕРКА ФИТОЛЕНТЫ (перегрев) =====
+  static unsigned long lampOffTime = 0;
+  static bool lampOverheated = false;
+  
+  if (lampState && millis() - lastLampTurnOnTime > 3600000) {  // Лампа работает час
+    if (!lampOverheated) {
+      lampOverheated = true;
+      showAlertOnDisplay("GROW LIGHT HOT!", PRIORITY_MEDIUM);
+      Serial.println("ALERT: Medium - Grow light has been on for over 1 hour");
+    }
+  } else if (!lampState) {
+    lampOverheated = false;
+  }
+  
+  // ===== 7. ПРОВЕРКА НАСОСА (долгая работа) =====
+  if (pumpState && (millis() - pumpStartTime > 30000)) {
+    if (now - lastSensorErrorAlert > 60000) {
+      lastSensorErrorAlert = now;
+      showAlertOnDisplay("PUMP RUNNING TOO LONG!", PRIORITY_HIGH);
+      playAlert(PRIORITY_HIGH);
+      Serial.println("ALERT: High - Pump running more than 30 seconds!");
+      
+      // Аварийное выключение насоса
+      digitalWrite(PUMP_PIN, LOW);
+      pumpState = false;
+      Serial.println("EMERGENCY: Pump forced OFF");
+    }
+  }
+}
+
+// Функция для отправки в Telegram (в перспективе)
+void sendTelegramAlert(const char* message) {
+  // Для ESP8266 версии
+  #ifdef ESP8266
+    String url = "/bot" + String(TELEGRAM_BOT_TOKEN) + "/sendMessage";
+    url += "?chat_id=" + String(TELEGRAM_CHAT_ID);
+    url += "&text=" + String(message);
+    // Отправка HTTP запроса
+  #endif
+  Serial.print("TELEGRAM: ");
+  Serial.println(message);
+}
+```
+
+#### Логирование всех оповещений:
+``` cpp
+// Запись оповещений в лог (на microSD)
+void logAlert(const char* message, AlertPriority priority) {
+  #ifdef SD_AVAILABLE
+    File logFile = SD.open("alerts.csv", FILE_WRITE);
+    if (logFile) {
+      logFile.print(millis() / 1000);  // время в секундах
+      logFile.print(",");
+      logFile.print(priority);
+      logFile.print(",");
+      logFile.print(message);
+      logFile.println();
+      logFile.close();
+    }
+  #endif
+}
+```
+
+#### Интерфейс на дисплее при оповещении:
+``` cpp
+При нормальном режиме:
+┌────────────────────────────────┐
+│ TEMPERATURE: 24.5 C            │
+│ WINDOW: CLOSED                 │
+└────────────────────────────────┘
+
+При критической ситуации:
+┌────────────────────────────────┐
+│ !!! CRITICAL !!!               │
+│ NO WATER!                      │
+└────────────────────────────────┘
+(экран мигает, зуммер пищит)
+
+При предупреждении:
+┌────────────────────────────────┐
+│ !! WARNING !!                  │
+│ TEMP: 36.2C!                   │
+└────────────────────────────────┘
+(экран не мигает, но зуммер пищит)
+```
+
+---
+
