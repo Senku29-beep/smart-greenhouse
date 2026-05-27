@@ -422,15 +422,23 @@ wdt_enable(WDTO_4S);  // Включаем watchdog с таймаутом 4 се�
 ---
 
 ### 📁 Состав репозитория
-
-- `smart_greenhouse.ino` — основной код программы
-- `LICENSE` — лицензия MIT
-- `README.md` — описание проекта (этот файл)
-- `photos/` — фотографии процесса сборки
-  - `schema.png` — схема подключения
-  - `greenhouse.jpg` — фото теплицы
-  - `display.jpg` — фото работающего дисплея
-  - `assembly.jpg` — фото процесса сборки
+```cpp
+smart-greenhouse/
+├── smart_greenhouse.ino          ✅ Основной код
+├── README.md                      ✅ Описание
+├── LICENSE                        ✅ Лицензия MIT
+├── ROADMAP.md                     ✅ План развития
+├── CONTRIBUTING.md                ✅ Как помочь
+├── FUNCTION.md                    ✅ Описание функций (у вас есть)
+├── CHANGELOG.md                   
+├── tests/                         ✅ Тестовые скетчи
+│   ├── test_all_sensors.ino
+│   ├── test_dht11.ino
+│   ├── test_display.ino
+│   ├── test_servo.ino
+│   └── test_water_sensor.ino
+├── photos/                        ✅ Фото сборки
+```
 
 ---
 
