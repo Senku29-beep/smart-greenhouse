@@ -1,30 +1,80 @@
-// Тест датчика температуры и влажности DHT11
+/*
+  ======================================================================
+  ТЕСТ ДАТЧИКА ТЕМПЕРАТУРЫ И ВЛАЖНОСТИ DHT11
+  ======================================================================
+  
+  НАЗНАЧЕНИЕ:
+  Проверить, правильно ли работает датчик DHT11, и определить,
+  нужно ли подключать подтягивающий резистор 10 кОм.
+  
+  ПОДКЛЮЧЕНИЕ:
+  - VCC  → 5V Arduino
+  - DATA → Pin 2 Arduino
+  - GND  → GND Arduino
+  
+  ПРИНЦИП РАБОТЫ:
+  Датчик каждые 2 секунды отправляет данные. Если данные корректны,
+  выводим температуру и влажность. Если нет — сообщаем об ошибке.
+  
+  ВОЗМОЖНЫЕ ПРОБЛЕМЫ:
+  - Если постоянно "ERROR" → добавьте резистор 10 кОм между DATA и VCC
+  - Если значения не меняются → датчик завис, нужна перезагрузка
+  ======================================================================
+*/
+
 #include <DHT.h>
 
-#define DHT_PIN 2
-#define DHTTYPE DHT11
+#define DHT_PIN 2      // Пин подключения данных
+#define DHTTYPE DHT11  // Тип датчика
 
 DHT dht(DHT_PIN, DHTTYPE);
 
 void setup() {
   Serial.begin(9600);
-  Serial.println("Testing DHT11...");
+  Serial.println(F("========================================"));
+  Serial.println(F("ТЕСТ ДАТЧИКА DHT11"));
+  Serial.println(F("========================================"));
+  Serial.println(F("Ожидание 2 секунды для стабилизации..."));
+  
+  delay(2000);  // DHT11 требует времени на первый запуск
   dht.begin();
+  
+  Serial.println(F("Начинаю чтение датчика...\n"));
 }
 
 void loop() {
-  float temp = dht.readTemperature();
-  float hum = dht.readHumidity();
+  // Считываем температуру в градусах Цельсия
+  float temperature = dht.readTemperature();
   
-  if (isnan(temp) || isnan(hum)) {
-    Serial.println("ERROR: Sensor not responding!");
+  // Считываем влажность в процентах
+  float humidity = dht.readHumidity();
+  
+  // Проверяем, удалось ли считать данные
+  // isnan() — функция, которая проверяет, является ли значение "не числом"
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println(F("[ОШИБКА] Датчик не отвечает!"));
+    Serial.println(F("  Возможные причины:"));
+    Serial.println(F("  1. Нет подтягивающего резистора 10кОм между DATA и VCC"));
+    Serial.println(F("  2. Неправильное подключение (перепутаны пины)"));
+    Serial.println(F("  3. Датчик неисправен"));
   } else {
-    Serial.print("Temperature: ");
-    Serial.print(temp);
-    Serial.print("C, Humidity: ");
-    Serial.print(hum);
-    Serial.println("%");
+    // Данные корректны — выводим их
+    Serial.print(F("[OK] Температура: "));
+    Serial.print(temperature);
+    Serial.print(F("°C, Влажность: "));
+    Serial.print(humidity);
+    Serial.println(F("%"));
+    
+    // Визуальная шкала для наглядности
+    Serial.print(F("     Шкала: "));
+    for (int i = 0; i < (int)humidity / 10; i++) {
+      Serial.print("#");
+    }
+    Serial.println();
   }
   
+  Serial.println(F("----------------------------------------"));
+  
+  // DHT11 требует минимум 2 секунды между чтениями!
   delay(2000);
 }
