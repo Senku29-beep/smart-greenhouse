@@ -146,7 +146,6 @@ smart-greenhouse/
 ├── README.md                      ✅ Описание
 ├── LICENSE                        ✅ Лицензия MIT
 ├── ROADMAP.md                     ✅ План развития
-├── CONTRIBUTING.md                ✅ Как помочь
 ├── FUNCTION.md                    ✅ Описание функций 
 ├── CHANGELOG.md                   
 ├── tests/                         ✅ Тестовые скетчи
