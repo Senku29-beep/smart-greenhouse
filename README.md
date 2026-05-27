@@ -147,7 +147,7 @@ smart-greenhouse/
 ├── LICENSE                        ✅ Лицензия MIT
 ├── ROADMAP.md                     ✅ План развития
 ├── CONTRIBUTING.md                ✅ Как помочь
-├── FUNCTION.md                    ✅ Описание функций (у вас есть)
+├── FUNCTION.md                    ✅ Описание функций 
 ├── CHANGELOG.md                   
 ├── tests/                         ✅ Тестовые скетчи
 │   ├── test_all_sensors.ino
